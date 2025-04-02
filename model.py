@@ -3,8 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
-
+from torchvision import transforms
+import numpy as np
 class CustomCNN(nn.Module):
+
     def __init__(
         self,
         input_shape=(3, 224, 224),  # (channels, height, width)
@@ -69,6 +71,13 @@ class CustomCNN(nn.Module):
             return F.leaky_relu(x, 0.1)
         elif name == 'sigmoid':
             return torch.sigmoid(x)
+        elif name == 'gelu':
+            return F.gelu(x)  # Gaussian Error Linear Unit
+        elif name == 'silu' or name == 'swish':
+            return F.silu(x)  # Sigmoid-Weighted Linear Unit (SiLU/Swish)
+        elif name == 'mish':
+            # Mish: x * tanh(softplus(x))
+            return x * torch.tanh(F.softplus(x))
         else:
             raise ValueError(f"Unknown activation: {name}")
     
@@ -86,58 +95,91 @@ class CustomCNN(nn.Module):
         x = self.fc2(x)  # No softmax (handled in loss)
         return x
     
-    def train_model(self, X_train, y_train, X_val, y_val, 
-                   batch_size=32, epochs=10, lr=0.001, device='cpu'):
+    def train_model(self, train_loader, val_loader, 
+               batch_size=32, epochs=10, lr=0.001, device='cpu'):
+        """
+        Train the model with proper device handling and training loop
         
-        # Convert to tensors
-        X_train = torch.FloatTensor(X_train).to(device)
-        y_train = torch.LongTensor(y_train).to(device)
-        X_val = torch.FloatTensor(X_val).to(device)
-        y_val = torch.LongTensor(y_val).to(device)
-        
-        # Create dataloaders
-        train_dataset = TensorDataset(X_train, y_train)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        Args:
+            train_loader: DataLoader for training data
+            val_loader: DataLoader for validation data
+            batch_size: Size of mini-batches
+            epochs: Number of training epochs
+            lr: Learning rate
+            device: Device to train on ('cpu' or 'cuda')
+        """
+        # Move model to device first
+        self.to(device)
         
         # Loss and optimizer
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(self.parameters(), lr=lr)
         
-        # Move model to device
-        self.to(device)
-        
+        # Training loop
         for epoch in range(epochs):
             self.train()
             running_loss = 0.0
+            correct = 0
+            total = 0
             
-            for batch_X, batch_y in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+            # Wrap train_loader with tqdm for progress bar
+            train_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+            
+            for batch_X, batch_y in train_iter:
+                # Move data to same device as model
+                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                
+                # Zero gradients
                 optimizer.zero_grad()
                 
+                # Forward pass
                 outputs = self(batch_X)
                 loss = criterion(outputs, batch_y)
+                
+                # Backward pass and optimize
                 loss.backward()
                 optimizer.step()
                 
+                # Calculate statistics
                 running_loss += loss.item()
+                _, predicted = torch.max(outputs.data, 1)
+                total += batch_y.size(0)
+                correct += (predicted == batch_y).sum().item()
                 
-                # Print batch stats
-                print(f"\rBatch loss: {loss.item():.4f}", end='')
+                # Update progress bar
+                train_iter.set_postfix({
+                    'loss': loss.item(),
+                    'acc': 100 * correct / total
+                })
             
-            # Epoch stats
+            # Calculate epoch statistics
             train_loss = running_loss / len(train_loader)
-            val_loss, val_acc = self.evaluate(X_val, y_val, batch_size, device)
+            train_acc = 100 * correct / total
             
+            # Validation
+            val_loss, val_acc = self.evaluate(val_loader, device)
+            
+            # Print epoch summary
             print(f"\nEpoch {epoch+1}/{epochs} - "
-                  f"Train Loss: {train_loss:.4f} - "
-                  f"Val Loss: {val_loss:.4f} - "
-                  f"Val Acc: {val_acc:.2f}%")
-    
-    def evaluate(self, X, y, batch_size=32, device='cpu'):
+                f"Train Loss: {train_loss:.4f} - Train Acc: {train_acc:.2f}% - "
+                f"Val Loss: {val_loss:.4f} - Val Acc: {val_acc:.2f}%")
+    def evaluate(self, loader, device='cpu'):
+        """
+        Evaluate the model on a given dataset
+        
+        Args:
+            loader: DataLoader for evaluation data
+            device: Device to evaluate on ('cpu' or 'cuda')
+        
+        Returns:
+            tuple: (average loss, accuracy percentage)
+        """
+        # Set device if not specified
         if device is None:
-            device = next(self.parameters()).device  # Use model's current device
+            device = next(self.parameters()).device
+            
+        # Switch to evaluation mode
         self.eval()
-        dataset = TensorDataset(X, y)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
         
         criterion = nn.CrossEntropyLoss()
         total_loss = 0.0
@@ -146,28 +188,38 @@ class CustomCNN(nn.Module):
         
         with torch.no_grad():
             for batch_X, batch_y in loader:
-                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-                outputs = self(batch_X)
-                loss = criterion(outputs, batch_y)
-                total_loss += loss.item()
+                # Move data to the same device as model
+                batch_X = batch_X.to(device)
+                batch_y = batch_y.to(device)
                 
-                _, predicted = torch.max(outputs.data, 1)
+                # Forward pass
+                outputs = self(batch_X)
+                
+                # Calculate loss
+                loss = criterion(outputs, batch_y)
+                total_loss += loss.item() * batch_X.size(0)  # Weight by batch size
+                
+                # Calculate accuracy
+                _, predicted = torch.max(outputs, 1)
                 total += batch_y.size(0)
                 correct += (predicted == batch_y).sum().item()
         
-        return total_loss / len(loader), 100 * correct / total
+        # Calculate average loss and accuracy
+        avg_loss = total_loss / total
+        accuracy = 100 * correct / total
+        
+        return avg_loss, accuracy
     
-    def predict(self, X, batch_size=32, device=None):
+    def predict(self, loader, device=None):
         """
-        Make predictions on input data.
+        Make predictions using a DataLoader.
         
         Args:
-            X: Input data (numpy array or torch.Tensor)
-            batch_size: Batch size for prediction
+            loader: DataLoader containing input data
             device: Target device ('cpu', 'cuda', or None for auto-detection)
         
         Returns:
-            List of predicted class indices
+            numpy.ndarray: Array of predicted class indices
         """
         # Set model to eval mode
         self.eval()
@@ -176,22 +228,15 @@ class CustomCNN(nn.Module):
         if device is None:
             device = next(self.parameters()).device
         
-        # Convert input to tensor and move to correct device
-        if not isinstance(X, torch.Tensor):
-            X = torch.FloatTensor(X)
-        X = X.to(device)
-        
-        # Create DataLoader without unnecessary copying
-        dataset = TensorDataset(X)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-        
         predictions = []
         with torch.no_grad():
             for batch in loader:
-                # Handle single-tensor batches properly
-                inputs = batch[0].to(device)
+                # Handle both (data,) and (data, target) batch formats
+                inputs = batch[0] if isinstance(batch, (list, tuple)) else batch
+                inputs = inputs.to(device)
+                
                 outputs = self(inputs)
                 _, batch_preds = torch.max(outputs, 1)
-                predictions.extend(batch_preds.cpu().numpy().tolist())
+                predictions.append(batch_preds.cpu().numpy())
         
-        return predictions
+        return np.concatenate(predictions)
