@@ -1,0 +1,10 @@
+/BSR
+/venv
+main.pdf
+PA2_mm21b030.zip
+DL_ASS2
+vgg16_finetuned.pth
+data/
+inaturalist_12K/
+wandb/
+best_model.pth
