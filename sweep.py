@@ -1,61 +1,87 @@
+from torchvision import transforms
 import wandb
-from model import CustomCNN  # Assuming your model class is named CustomCNN
-import numpy as np
+from model import CustomCNN 
+import torch
+from torch.utils.data import DataLoader, random_split, ConcatDataset
+from torchvision import transforms, datasets
 
-# Correct sweep configuration
+# Training transforms (with augmentation)
+aug_transform = transforms.Compose([
+    transforms.RandomResizedCrop(224),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(15),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# Base transform (without augmentation)
+base_transform = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# Required sweep configuration
 sweep_config = {
-    "name": "CNN_Sweep_v1",
-    "method": "grid",  # Alternatives: "random" or "bayes"
+    "name": "CNN_Sweep_v3",
+    "method": "grid",
     "metric": {
         "name": "val_accuracy",
         "goal": "maximize"
     },
     "parameters": {
         "epochs": {
-            "values": [5]
+            "values": [10]
         },
         "filters": {
             "values": [
-                [32, 32, 32, 32, 32],
-                [32, 64, 128, 256, 512]
+                [64, 64, 64, 64, 64]
             ]
         },
         "activations": {
             "values": [
-                ['relu']*5,
-                ['selu']*5
+                ['silu']*5
             ]
         },
         "use_batchnorm": {
-            "values": [True, False]
+            "values": [True]
         },
         "dropout_rates": {
             "values": [
-                [0.1, 0.1, 0.2, 0.2, 0.3],
-                [0.2, 0.2, 0.3, 0.3, 0.4]
+                [0, 0, 0.2, 0.2, 0.2]
             ]
         },
-        "learning_rate": {
-            "values": [0.001, 0.0001]
+        "augmentation": {
+            "values": [True, False]
         }
     }
 }
 
-# Initialize the sweep
-sweep_id = wandb.sweep(sweep_config, project="DL_CNN")
-
 def train():
-    # Initialize W&B run
-    run = wandb.init(project="DL_CNN")
+    run = wandb.init(project="DL_CNN", reinit=True)
     
-    # Generate descriptive run name
-    run_name = (f"filters_{'_'.join(map(str, wandb.config.filters))}_"
-                f"act_{wandb.config.activations[0]}_"
-                f"bn_{wandb.config.use_batchnorm}_"
-                f"dr_{'_'.join(map(str, wandb.config.dropout_rates))}")
-    wandb.run.name = run_name
+    # Load datasets
+    data_dir = "DL_ASS2/inaturalist_12K/train"
     
-    # Initialize model with sweep parameters
+    # Always use base transform for validation (20% split)
+    full_dataset = datasets.ImageFolder(data_dir, transform=base_transform)
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+    
+    # Apply augmentation to training set if configured
+    if wandb.config.augmentation:
+        aug_dataset = datasets.ImageFolder(data_dir, transform=aug_transform)
+        # Combine original and augmented training data
+        train_dataset = ConcatDataset([train_dataset, aug_dataset])
+    
+    # Create loaders
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=2)
+    
+    # Initialize model
     model = CustomCNN(
         input_shape=(3, 224, 224),
         num_classes=10,
@@ -69,20 +95,13 @@ def train():
         pool_sizes=[2, 2, 2, 2, 2]
     )
     
-    # Train the model (assuming your model has these methods)
-    model.train(X_train, y_train, epochs=wandb.config.epochs, batch_size=32)
-    
-    # Evaluate
-    y_pred = model.predict(X_val)
-    val_accuracy = np.mean(np.argmax(y_pred, axis=1) == np.argmax(y_val, axis=1))
-    
-    # Log metrics
-    wandb.log({
-        "val_accuracy": val_accuracy,
-        "epochs": wandb.config.epochs
-    })
-    
+    # Train and evaluate
+    model.train_model(train_loader, val_loader,
+                    batch_size=8, epochs=wandb.config.epochs, device='cuda')
+    acc = model.evaluate(val_loader, device="cuda")[1]
+    wandb.log({"val_accuracy": acc})
     run.finish()
 
-# Start the sweep
-wandb.agent(sweep_id, train)
+# Initialize and run sweep
+sweep_id = wandb.sweep(sweep_config, project="DL_CNN")
+wandb.agent(sweep_id, function=train)
